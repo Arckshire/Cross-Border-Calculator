@@ -381,6 +381,29 @@ def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _col_width(series: pd.Series,
+               hard_min: int = 14,
+               hard_max: int = 42,
+               pad: int = 2) -> int:
+    """Return a safe Excel column width that survives NaN / Arrow / mixed dtypes."""
+    try:
+        if len(series) == 0:
+            return hard_min
+        # Fill NaN BEFORE converting to string so PyArrow backend doesn't
+        # leak floats through .astype(str). Then use the vectorized str.len()
+        # which returns NA-safe lengths, and coerce NA to 0 with fillna.
+        s = series.astype(object).where(series.notna(), "")
+        lengths = s.astype(str).str.len()
+        try:
+            lengths = lengths.fillna(0)
+        except Exception:
+            pass
+        max_len = int(lengths.max()) if len(lengths) else 0
+        return min(hard_max, max(hard_min, max_len + pad))
+    except Exception:
+        return hard_min
+
+
 def build_excel(per_shipment: pd.DataFrame, per_lane: pd.DataFrame) -> bytes:
     """Build the 2-sheet Excel report and return bytes."""
     per_shipment = _strip_tz(per_shipment)
@@ -399,17 +422,21 @@ def build_excel(per_shipment: pd.DataFrame, per_lane: pd.DataFrame) -> bytes:
 
         for sheet_name, df in [("Per Shipment", per_shipment), ("Lane Statistics", per_lane)]:
             ws = writer.sheets[sheet_name]
-            # Format header row
+            # Format header row + column widths
             for col_idx, col_name in enumerate(df.columns):
-                ws.write(0, col_idx, col_name, header_fmt)
-                # Reasonable column width
-                max_len = min(40, max(12, int(df[col_name].astype(str).map(len).max() if len(df) else 12)))
-                ws.set_column(col_idx, col_idx, max_len + 2)
+                try:
+                    ws.write(0, col_idx, col_name, header_fmt)
+                except Exception:
+                    pass
+                ws.set_column(col_idx, col_idx, _col_width(df[col_name]))
             ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, max(len(df), 0), len(df.columns) - 1)
+            if len(df) > 0 and len(df.columns) > 0:
+                ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
             # Highlight "missing data" rows on the Per Shipment sheet
-            if sheet_name == "Per Shipment" and "BORDER_CROSSING_DURATION" in df.columns and len(df):
+            if (sheet_name == "Per Shipment"
+                    and "BORDER_CROSSING_DURATION" in df.columns
+                    and len(df) > 0):
                 col_idx = list(df.columns).index("BORDER_CROSSING_DURATION")
                 ws.conditional_format(
                     1, col_idx, len(df), col_idx,
